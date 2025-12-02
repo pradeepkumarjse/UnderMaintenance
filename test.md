@@ -5,8 +5,7 @@
 **Channel Name:** GetPatient  
 **Type:** Polling JavaScript Receiver → JavaScript Destination  
 
-**Purpose:**  
-This channel periodically retrieves a **Bearer token**, calls an external **Patient API**, receives a JSON array of patients, and updates a PostgreSQL table (`adt_messages`) by inserting the **patient_id** for matching MRNs.
+**Purpose:** This channel periodically retrieves a **Bearer token**, calls an external **Patient API**, receives a JSON array of patients, and updates a PostgreSQL table (`adt_messages`) by inserting the **patient_id** for matching MRNs.
 
 The workflow repeats automatically every **5 minutes**.
 
@@ -53,7 +52,7 @@ The source simply returns `1`, triggering the workflow during each poll.
 **Endpoint:**  
 ```
 
-[https://telemetry-rhm.select.corp.sem/core/api-token-auth/](https://telemetry-rhm.select.corp.sem/core/api-token-auth/)
+https://telemetry-rhm.select.corp.sem/core/api-token-auth/
 
 ```
 
@@ -241,5 +240,4 @@ logger.error("Error executing POST/GET request: " + e);
 
   * `medical_record_number`
   * `patient_id`
-
 ---
