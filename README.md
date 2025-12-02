@@ -1,4 +1,4 @@
-# CS_SERACH_ID_QUERY – README
+# CS_SERACH_ID_QUERY
 
 ## 1. Overview
 
