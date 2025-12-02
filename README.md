@@ -1,11 +1,21 @@
-# CS_SERACH_ID_QUERY – README
+# EpicIDSearch – README
 
 ## 1. Overview
 
-**Channel Name:** CS_SERACH_ID_QUERY  
+**Channel Name:** EpicIDSearch  
+**Protocol:** HTTP Listener  
+**Port:** 4000  
+**Response Format:** JSON  
 
-**Purpose:**  
-Receives XML messages over **TCP port 2806**, extracts **PTID (patient ID)**, queries a **PostgreSQL** database, and returns an XML response containing patient demographic details (name, sex, DOB, location).
+The EpicIDSearch channel exposes an HTTP API that accepts **query parameters** (encounterid or medical_record_number), queries a **PostgreSQL database**, and returns **patient demographic data** in JSON format.
+
+This channel supports:
+
+1. **Search by Encounter ID**  
+2. **Search by Medical Record Number (MRN)**  
+3. **Automatic detection** of which search parameter is provided  
+4. **JSON output** with patient details  
+5. **Age-based classification (adult / pediatric / neonate)**  
 
 ---
 
@@ -13,106 +23,268 @@ Receives XML messages over **TCP port 2806**, extracts **PTID (patient ID)**, qu
 
 ```
 
-External System → TCP Listener (Port 2806)
-→ Extract PTID from incoming XML
-→ Query PostgreSQL (adt_messages table)
-→ Build XML response (REP_PT_INFO)
-→ Send back the response over same TCP connection
+External System
+↓ HTTP GET /?encounterid=... OR /?medical_record_number=...
+HTTP Listener (Port 4000)
+↓ Parse Query Parameters
+↓ Evaluate Which Search to Perform
+↓ Search PostgreSQL (adt_messages)
+↓ Build JSON Response
+↓ Return JSON to Client
+
+```
+
+---
+
+## 3. Input Request Format
+
+### Supported Query Parameters
+
+| Parameter | Required | Purpose |
+|----------|----------|---------|
+| `encounterid` | Optional | Search by encounter ID |
+| `medical_record_number` | Optional | Search by MRN (supports multiple comma-separated MRNs) |
+
+You must provide **one of the two**.
+
+### Example Requests
+
+#### Search by Encounter ID
+
+```
+
+GET http://<server>:4000/?encounterid=ENC1234
+
+```
+
+#### Search by MRN (single)
+
+```
+
+GET http://<server>:4000/?medical_record_number=MRN1001
+
+```
+
+#### Search by MRN (multiple)
+
+```
+
+GET http://<server>:4000/?medical_record_number=MRN1,MRN2,MRN3
 
 ````
 
 ---
 
-## 3. Input / Output
+## 4. Output Response Format
 
-### 3.1 Input XML Format
+### 4.1 Response for Encounter ID Search
 
-Incoming message must be an XML similar to:
+If record found:
 
-```xml
-<REQ_PT_INFO>
-    <PTID>12345</PTID>
-</REQ_PT_INFO>
+```json
+{
+  "encounterid": "12345",
+  "first_name": "John",
+  "last_name": "Doe",
+  "medical_record_number": "MRN001",
+  "date_of_birth": "1990-11-02",
+  "gender": "M",
+  "patient_type": "adult",
+  "height": 175,
+  "weight": 75
+}
 ````
 
-The channel extracts the value inside `<PTID>...</PTID>`.
+If no record found:
 
----
-
-### 3.2 Output XML Response
-
-#### If patient found:
-
-```xml
-<REP_PT_INFO>
-    <PTID>12345</PTID>
-    <DATA_NO>1</DATA_NO>
-    <DATA>
-        <KANA>LastName FirstName</KANA>
-        <SEX>M</SEX>
-        <BIRTH>1990/12/01</BIRTH>
-        <LOCATION>TOKYO</LOCATION>
-    </DATA>
-</REP_PT_INFO>
-```
-
-#### If patient NOT found:
-
-```xml
-<REP_PT_INFO>
-    <PTID>12345</PTID>
-    <DATA_NO>0</DATA_NO>
-</REP_PT_INFO>
-```
-
-#### If DB error:
-
-```xml
-<REP_PT_INFO>
-    <ERROR>Network Connection Lost</ERROR>
-</REP_PT_INFO>
+```json
+{ "message": "No records found.." }
 ```
 
 ---
 
-## 4. Configuration
+### 4.2 Response for MRN Search
 
-### 4.1 Source Connector (Receiver)
+If results contain **multiple patients**, an array is returned:
 
-* **Type:** TCP Listener
-* **Host:** `0.0.0.0` (accepts all inbound connections)
-* **Port:** `2806`
-* **Respond After Processing:** Yes
-* **DataType:** XML
+```json
+[
+  {
+    "mrn": "MRN101",
+    "first_name": "A",
+    "last_name": "B",
+    "encounterid": "E1",
+    "date_of_birth": "1988-01-01",
+    "gender": "F"
+  },
+  {
+    "mrn": "MRN102",
+    "first_name": "C",
+    "last_name": "D",
+    "encounterid": "E2",
+    "date_of_birth": "1975-04-21",
+    "gender": "M"
+  }
+]
+```
 
-Incoming XML is accepted and passed to the transformer.
+If one record found, single JSON object returned.
+If none found:
+
+```json
+{ "message": "No records found.." }
+```
 
 ---
 
-### 4.2 Destination Connector
+## 5. Search Logic
 
-* **Name:** `resp`
-* **Type:** JavaScript Writer
-* **Function:** Build XML response and return it to TCP client.
+### Parameter Extraction (Transformer JS)
 
-#### Database Connection (PostgreSQL)
+The channel extracts query variables from HTTP URL:
+
+* Splits incoming query string
+* Decodes keys & values
+* Identifies which parameter is present
+* Sets flags:
+
+  * `Isencounterid` = 1 if encounterid is provided
+  * `Ismedical_record_number` = 1 if MRN is provided
+
+---
+
+## 6. Database Queries
+
+### PostgreSQL Connection
+
+Connection used by both destination scripts:
 
 ```javascript
-dbConn = DatabaseConnectionFactory.createDatabaseConnection(
-    'org.postgresql.Driver',
-    'jdbc:postgresql://db1:5432/mirthdb',
-    'mirthdb',
-    'mirthdb'
+DatabaseConnectionFactory.createDatabaseConnection(
+  'org.postgresql.Driver',
+  'jdbc:postgresql://db1:5432/mirthdb',
+  'mirthdb',
+  'mirthdb'
 );
 ```
 
+### Encounter ID Query
+
+Searches by encounterid, returns one row:
+
+```sql
+SELECT id, first_name, last_name, medical_record_number,
+       date_of_birth, gender, height, weight
+FROM adt_messages
+WHERE encounterid = ?
+ORDER BY id
+LIMIT 1;
+```
+
+### MRN Query (supports multiple MRNs)
+
+```sql
+SELECT DISTINCT first_name, last_name, encounterid,
+       date_of_birth, gender, medical_record_number
+FROM adt_messages
+WHERE medical_record_number IN (?, ?, ?, ...)
+```
+
 ---
 
-## 5. Deployment Requirements
+## 7. Business Rules
 
-### 5.1 Server Requirements
+### Age Classification
 
-* Windows Server with RDP access
-* Mirth Connect installed (v4.5.2)
-* PostgreSQL accessible on the network (`db1:5432`)
-* Firewall rule allowing **Inbound TCP port 2806**
+Age in months is calculated:
+
+| Age in Months | Category  |
+| ------------- | --------- |
+| ≥ 216 months  | adult     |
+| 1–215 months  | neonate   |
+| < 1 month     | pediatric |
+
+---
+
+## 8. Channel Structure (Summary)
+
+### **Source Connector**
+
+* **Type:** HTTP Listener
+* **Host:** 0.0.0.0
+* **Port:** 4000
+* **Response Type:** JSON
+* **Parses query parameters** in transformer
+
+### **Destination Connectors**
+
+1. **Search encounterid**
+
+   * Executes encounterid DB query
+   * Outputs JSON
+
+2. **Search MRN**
+
+   * Supports multiple MRNs
+   * Returns single JSON or array
+
+3. **Final Response**
+
+   * Returns `response_patientData` JSON to caller
+
+---
+
+## 9. Deployment Requirements
+
+* Windows Server with Mirth installed
+* Mirth Connect v4.5.2
+* PostgreSQL accessible at `db1:5432`
+* DB credentials:
+
+  * **User:** mirthdb
+  * **Password:** mirthdb
+* Firewall open:
+
+  * **HTTP port 4000**
+
+---
+
+## 10. Example Success Response
+
+```json
+{
+  "first_name": "John",
+  "last_name": "Doe",
+  "encounterid": "E10001",
+  "medical_record_number": "MRN2001",
+  "date_of_birth": "1985-03-22",
+  "gender": "M",
+  "patient_type": "adult",
+  "height": 180,
+  "weight": 80
+}
+```
+
+---
+
+## 11. Example Error Response
+
+### Database Error Handling
+
+If DB connection fails, the logs capture the error & stack trace.
+
+Returned JSON may look like:
+
+```json
+{ "message": "No records found.." }
+```
+---
+## 12. Maintainer Notes
+
+* Query parsing logic is inside Source Transformer
+* EncounterID and MRN searches are mutually exclusive
+* Response always returned as JSON
+* Logging includes DOB, age calculation & query diagnostics
+
+```
+```
