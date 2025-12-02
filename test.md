@@ -1,258 +1,164 @@
-# PDF_Listener – README
+
+# PurgeMirthDB – README
 
 ## 1. Overview
 
-**Channel Name:** PDF_Listener  
-**Protocol:** HTTP Listener (JSON + PDF binary)  
+**Channel Name:** PurgeMirthDB  
+**Type:** JavaScript Polling Channel  
 
-**Purpose:** This channel receives **JSON payloads (with optional PDF content or URL)** from a remote system.  
-It extracts *patient information + order details + reviewer info*, enriches data from PostgreSQL, and sets all values into `channelMap` for downstream processing by other channels.
+**Purpose:** This channel automatically performs **PostgreSQL VACUUM FULL VERBOSE ANALYZE** on internal Mirth Connect database tables to reclaim disk space, remove bloat, and maintain optimal performance.
+
+It is designed to run on a schedule **twice per day (every 12 hours)**.
 
 ---
 
 ## 2. High-Level Workflow
 
 ```
-External System → POST JSON/PDF → HTTP Listener (port 4001)
+
+Scheduler (every 12 hours)
 ↓
-Parse JSON payload
+Run JavaScript via Source Transformer
 ↓
-If EMR order ID missing → lookup from rpm_orders table
+Open PostgreSQL connection
 ↓
-Lookup demographics from adt_messages table using MRN
+Execute:
+VACUUM FULL VERBOSE ANALYZE d_mc6;
+VACUUM FULL VERBOSE ANALYZE d_mc2;
 ↓
-If message_type = "Review" → capture URL
-Else → store PDF binary
+Log output / catch errors
 ↓
-Populate channelMap variables
+Close DB connection
 ↓
-Forward processing by Destination Channel(s) (not included here)
+End
 
 ````
----
-
-## 3. Input Format
-
-### 3.1 JSON Input (example)
-
-```json
-{
-  "patient_id": "217057",
-  "message_type": "PDF",
-  "order_emr_id": 5814773,
-  "child_order_id": 5817367,
-  "rpm_order_id": 126,
-  "url": null,
-  "reviewer": null,
-  "reviewed_at": null,
-  "pdf": "<base64 PDF binary>"
-}
-````
-
-The channel supports **multipart and binary payloads**, automatically parsed by Mirth.
 
 ---
 
-## 4. Message Parsing Logic
+## 3. Polling Configuration
 
-### Extracted fields:
+### 3.1 Poll Type  
+**Interval-based polling**
 
-| Field            | Source                   | Required             |
-| ---------------- | ------------------------ | -------------------- |
-| `patient_id`     | JSON                     | Yes                  |
-| `message_type`   | JSON (`Review` or other) | Yes                  |
-| `order_emr_id`   | JSON or DB lookup        | Optional             |
-| `child_order_id` | JSON                     | Optional             |
-| `rpm_order_id`   | JSON                     | Yes                  |
-| `url`            | JSON                     | Only for Review      |
-| `pdf`            | JSON                     | Only for PDF uploads |
-| `reviewer`       | JSON                     | Optional             |
-| `reviewed_at`    | JSON                     | Optional             |
+| Setting | Value |
+|--------|-------|
+| Poll Type | INTERVAL |
+| Frequency | 43,200,000 ms |
+| Equivalent | **12 hours** |
+| Poll on Start | true |
+| Weekly advanced flags | Disabled |
 
----
-
-## 5. EMR Order ID Auto-Lookup
-
-If the incoming JSON does **not** contain `order_emr_id`, the channel will:
-
-### Query:
-
-```sql
-select order_emr_id 
-from rpm_orders 
-where medical_record_number = ?
-order by whenadded desc 
-limit 1;
-```
-
-Extracted value → stored as `emr_order_id`.
-
-If no record found → `child_order_id = ""`.
+This ensures the maintenance routine runs twice per day.
 
 ---
 
-## 6. Reviewed_at Timestamp Reformatting
+## 4. Database Maintenance Logic
 
-Incoming format:
+Inside the JavaScript Source Transformer, the following sequence is executed:
 
-```
-2025-03-12T05:30:22.047266+00:00
-```
-
-Converted to HL7/DB friendly format:
-
-```
-yyyyMMddHHmmss
-```
-
-Example: `20250312053022`
-
----
-
-## 7. Patient Demographic Lookup (adt_messages)
-
-Query:
-
-```sql
-SELECT pv1,first_name,last_name,date_of_birth,gender,
-       marital_status,phone_number,address1,city,state,zip 
-FROM adt_messages 
-WHERE medical_record_number = ?
-ORDER BY id 
-LIMIT 1;
-```
-
-If found, the channel populates:
-
-* `pv1`
-* `first_name`
-* `last_name`
-* `date_of_birth` (normalized into `YYYYMMDD`)
-* `gender`
-* `marital_status`
-* `phone_number`
-* `address1`
-* `city`
-* `state`
-* `zip`
-
-If not found → `filter = 1` (used by downstream routing).
-
----
-
-## 8. PDF & URL Handling
-
-| message_type   | Behavior                              |
-| -------------- | ------------------------------------- |
-| `"Review"`     | Uses `msg.url`, no PDF                |
-| Any other type | Extracts `msg.pdf` (base64 or binary) |
-
-Stored into:
-
-* `channelMap['url']`
-* `channelMap['PDF']`
-
----
-
-## 9. ChannelMap Variables (Final Output)
-
-The script outputs the following variables for downstream connectors:
-
-```
-patient_id
-message_type
-emr_order_id
-child_order_id
-rpm_order_id
-reviewer
-reviewed_at
-datetime
-medical_record_number
-pv1
-last_name
-first_name
-date_of_birth
-gender
-marital_status
-phone_number
-address1
-city
-state
-zip
-url (conditional)
-PDF (conditional)
-filter (determines routing path)
-```
-
----
-
-## 10. Source Connector Configuration
-
-| Setting                | Value                                                    |
-| ---------------------- | -------------------------------------------------------- |
-| Type                   | HTTP Listener                                            |
-| Host                   | 0.0.0.0                                                  |
-| Port                   | 4001                                                     |
-| parseMultipart         | true                                                     |
-| xmlBody                | false                                                    |
-| responseContentType    | application/json                                         |
-| respondAfterProcessing | true                                                     |
-| binaryMimeTypes        | `application/* (except json, xml)` + images/videos/audio |
-| timeout                | 30000 ms                                                 |
-
----
-
-## 11. Database Connection
-
-All DB calls use:
+### 4.1 Connect to PostgreSQL
 
 ```javascript
-DatabaseConnectionFactory.createDatabaseConnection(
+dbConn = DatabaseConnectionFactory.createDatabaseConnection(
   'org.postgresql.Driver',
   'jdbc:postgresql://db1:5432/mirthdb',
-  'mirthdb', 
+  'mirthdb',
   'mirthdb'
 );
+````
+
+If connection is successful, it proceeds to maintenance operations.
+
+---
+
+### 4.2 Execution of VACUUM FULL Commands
+
+```javascript
+var updateQuery1 = " VACUUM FULL VERBOSE ANALYZE d_mc6;";
+dbConn.executeUpdate(updateQuery1);
+
+var updateQuery2 = " VACUUM FULL VERBOSE ANALYZE d_mc2;";
+dbConn.executeUpdate(updateQuery2);
+```
+
+These target **two internal Mirth tables**:
+
+* `d_mc6`
+* `d_mc2`
+
+Performing:
+
+* VACUUM FULL → reclaims unused space
+* VERBOSE → logs detailed output
+* ANALYZE → updates planner statistics
+
+---
+
+## 5. Error Handling
+
+All database exceptions are logged:
+
+```javascript
+logger.error("Database query failed. Error: " + e.name + " - " + e.message);
+logger.error("Stack Trace: " + e.stack);
+```
+
+Closing the connection is guaranteed via `finally`:
+
+```javascript
+if (dbConn) dbConn.close();
 ```
 
 ---
 
-## 12. Deployment Requirements
+## 6. Destination Behavior
 
-* Mirth Connect v4.5.2
-* Windows/Linux server
-* PostgreSQL available at `db1:5432`
-* Inbound firewall rule:
+The channel has a **single destination**, named `dest1`, containing:
 
-  * **TCP 4001** for HTTP POST
-* Table requirements:
+```javascript
+return 0;
+```
 
-  * `rpm_orders`
-  * `adt_messages`
+This indicates the destination is not used for external dispatch; the maintenance task happens entirely in the Source Transformer.
 
 ---
 
-## 13. Example Review-Type Request
+## 7. Channel Settings Summary
 
-```json
-{
-  "patient_id": "217057",
-  "message_type": "Review",
-  "url": "https://example.com/review.pdf",
-  "reviewer": "Dr. Smith",
-  "reviewed_at": "2025-03-12T05:30:22.047266+00:00"
-}
-```
+| Component             | Value               |
+| --------------------- | ------------------- |
+| Source Connector      | JavaScript Reader   |
+| Trigger               | Poll every 12 hours |
+| Inbound/Outbound Type | RAW                 |
+| Message Storage       | Production Mode     |
+| Attachments           | Disabled            |
+| Global Map Clearing   | Enabled             |
+
+All scripts for preprocess / postprocess / deploy / undeploy are empty, ensuring no side effects.
 
 ---
 
-## 14. Example PDF Upload Request
+## 8. Why This Channel Is Important
 
-```json
-{
-  "patient_id": "217057",
-  "message_type": "PDF",
-  "pdf": "<base64_encoded_pdf_binary>",
-  "rpm_order_id": 126
-}
-```
+This channel performs essential DB maintenance:
+
+* Prevents Mirth DB from growing indefinitely
+* Eliminates table bloat
+* Improves query performance
+* Reduces disk usage
+* Prevents server slowdowns or outages
+
+Ideal for production environments where message volume is high.
+
+---
+
+## 9. Deployment Requirements
+
+* Mirth Connect **v4.5.2**
+* PostgreSQL server running on:
+  `db1:5432` (database: `mirthdb`)
+* `VACUUM FULL` permissions for the user `mirthdb`
+* Channel must remain **Enabled** and **Started**
+* No outbound firewall requirements
+* Should be run on servers with low load during maintenance windows
