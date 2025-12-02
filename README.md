@@ -3,11 +3,9 @@
 ## 1. Overview
 
 **Channel Name:** EpicIDSearch  
-**Protocol:** HTTP Listener  
-**Port:** 4000  
-**Response Format:** JSON  
 
-The EpicIDSearch channel exposes an HTTP API that accepts **query parameters** (encounterid or medical_record_number), queries a **PostgreSQL database**, and returns **patient demographic data** in JSON format.
+
+**Purpose:** The EpicIDSearch channel exposes an HTTP API that accepts **query parameters** (encounterid or medical_record_number), queries a **PostgreSQL database**, and returns **patient demographic data** in JSON format.
 
 This channel supports:
 
@@ -286,5 +284,3 @@ Returned JSON may look like:
 * Response always returned as JSON
 * Logging includes DOB, age calculation & query diagnostics
 
-```
-```
