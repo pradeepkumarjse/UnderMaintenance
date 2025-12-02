@@ -1,14 +1,13 @@
-
-# PurgeMirthDB – README
+# RPM_Orders_Queued_Process – README
 
 ## 1. Overview
 
-**Channel Name:** PurgeMirthDB  
-**Type:** JavaScript Polling Channel  
+**Channel Name:** RPM_Orders_Queued_Process  
+**Source:** JavaScript Reader (polling every 60 seconds)  
 
-**Purpose:** This channel automatically performs **PostgreSQL VACUUM FULL VERBOSE ANALYZE** on internal Mirth Connect database tables to reclaim disk space, remove bloat, and maintain optimal performance.
+**Purpose:** This channel checks for queued RPM orders in the PostgreSQL database, identifies HL7 files scheduled to be sent, reads the HL7 message from disk, transmits it, and deletes the file upon successful ACK (MSA|AA).
 
-It is designed to run on a schedule **twice per day (every 12 hours)**.
+Source File: :contentReference[oaicite:0]{index=0}
 
 ---
 
@@ -16,149 +15,199 @@ It is designed to run on a schedule **twice per day (every 12 hours)**.
 
 ```
 
-Scheduler (every 12 hours)
-↓
-Run JavaScript via Source Transformer
-↓
-Open PostgreSQL connection
-↓
-Execute:
-VACUUM FULL VERBOSE ANALYZE d_mc6;
-VACUUM FULL VERBOSE ANALYZE d_mc2;
-↓
-Log output / catch errors
-↓
-Close DB connection
-↓
-End
+Every 60 seconds →
+JS Reader polls DB →
+If queued order exists →
+Get filename →
+Read HL7 file from disk →
+Send HL7 over TCP (MLLP) to port 2002 →
+Wait for ACK →
+If ACK contains "MSA|AA|" → delete file
 
 ````
 
 ---
 
-## 3. Polling Configuration
+## 3. Detailed Processing Steps
 
-### 3.1 Poll Type  
-**Interval-based polling**
+### 3.1 Polling (Source Connector)
+
+- **Connector Type:** JavaScript Reader  
+- **Polling Frequency:** Every 60 seconds  
+- **Script Behavior:**
+  - Connects to PostgreSQL: `jdbc:postgresql://db1:5432/mirthdb`
+  - Queries:
+
+    ```sql
+    select concat(emr_child_id,'_',whensend,'.hl7') as filename
+    from rpm_orders
+    where issent = 0
+      and whensend < CURRENT_TIMESTAMP
+    order by whensend
+    limit 1;
+    ```
+
+  - If a file is found:
+    - `filter = 0`
+    - `filename = "<emr_child_id>_<timestamp>.hl7"`
+  - If none found:
+    - `filter = 1` (destination is skipped)
+
+### Mapped Variables:
+
+| Variable | Description |
+|---------|-------------|
+| `filename` | Name of HL7 file to send |
+| `filter` | 0 → send message; 1 → skip |
+
+---
+
+## 4. Filter Rule
+
+Destination executes **only when**:
+
+````
+
+$('filter') == 0
+
+```
+
+This prevents unnecessary TCP dispatching when there are no pending orders.
+
+---
+
+## 5. Destination Connector (TCP Sender)
+
+### 5.1 TCP Configuration
 
 | Setting | Value |
-|--------|-------|
-| Poll Type | INTERVAL |
-| Frequency | 43,200,000 ms |
-| Equivalent | **12 hours** |
-| Poll on Start | true |
-| Weekly advanced flags | Disabled |
+|--------|--------|
+| Remote IP | `127.0.0.1` |
+| Remote Port | `2002` |
+| Mode | MLLP |
+| Start Bytes | 0B |
+| End Bytes | 1C0D |
+| ACK Byte | 06 |
+| NACK Byte | 15 |
+| Response Timeout | 5000 ms |
 
-This ensures the maintenance routine runs twice per day.
+### 5.2 Read HL7 File
+
+File path constructed as:
+
+```
+
+/opt/connect/appdata/${filename}
+
+```
+
+Then:
+
+- Reads HL7 content using `FileUtil.read()`
+- Puts result into `hl7Message` (used as TCP template payload)
+
+### 5.3 Template Sent Over TCP
+
+```
+
+${hl7Message}
+
+```
 
 ---
 
-## 4. Database Maintenance Logic
+## 6. Response Handling (MLLP ACK Logic)
 
-Inside the JavaScript Source Transformer, the following sequence is executed:
+After sending:
 
-### 4.1 Connect to PostgreSQL
+1. Mirth receives ACK from remote system.
+2. If ACK text contains:
 
-```javascript
-dbConn = DatabaseConnectionFactory.createDatabaseConnection(
-  'org.postgresql.Driver',
-  'jdbc:postgresql://db1:5432/mirthdb',
-  'mirthdb',
-  'mirthdb'
-);
+```
+
+MSA|AA|
+
 ````
 
-If connection is successful, it proceeds to maintenance operations.
+Then:
+
+- Delete HL7 file:
+
+```javascript
+if (file.delete()) {
+    logger.info("File deleted successfully");
+}
+````
+
+Else:
+
+* File is **not deleted**
+* Warning is logged: *"TCP Response does not contain MSA|AA|"*
 
 ---
 
-### 4.2 Execution of VACUUM FULL Commands
+## 7. File Processing Directory
 
-```javascript
-var updateQuery1 = " VACUUM FULL VERBOSE ANALYZE d_mc6;";
-dbConn.executeUpdate(updateQuery1);
+**All HL7 files must be located at:**
 
-var updateQuery2 = " VACUUM FULL VERBOSE ANALYZE d_mc2;";
-dbConn.executeUpdate(updateQuery2);
+```
+/opt/connect/appdata/
 ```
 
-These target **two internal Mirth tables**:
+Example filename:
 
-* `d_mc6`
-* `d_mc2`
-
-Performing:
-
-* VACUUM FULL → reclaims unused space
-* VERBOSE → logs detailed output
-* ANALYZE → updates planner statistics
-
----
-
-## 5. Error Handling
-
-All database exceptions are logged:
-
-```javascript
-logger.error("Database query failed. Error: " + e.name + " - " + e.message);
-logger.error("Stack Trace: " + e.stack);
 ```
-
-Closing the connection is guaranteed via `finally`:
-
-```javascript
-if (dbConn) dbConn.close();
+12345_20250304123010.hl7
 ```
 
 ---
 
-## 6. Destination Behavior
+## 8. Database Requirements
 
-The channel has a **single destination**, named `dest1`, containing:
+### 8.1 Table: `rpm_orders`
 
-```javascript
-return 0;
-```
+Fields used:
 
-This indicates the destination is not used for external dispatch; the maintenance task happens entirely in the Source Transformer.
+| Column         | Purpose                         |
+| -------------- | ------------------------------- |
+| `emr_child_id` | Used to build filename          |
+| `whensend`     | Timestamp to determine ordering |
+| `issent`       | 0 = pending, 1 = sent           |
 
----
-
-## 7. Channel Settings Summary
-
-| Component             | Value               |
-| --------------------- | ------------------- |
-| Source Connector      | JavaScript Reader   |
-| Trigger               | Poll every 12 hours |
-| Inbound/Outbound Type | RAW                 |
-| Message Storage       | Production Mode     |
-| Attachments           | Disabled            |
-| Global Map Clearing   | Enabled             |
-
-All scripts for preprocess / postprocess / deploy / undeploy are empty, ensuring no side effects.
-
----
-
-## 8. Why This Channel Is Important
-
-This channel performs essential DB maintenance:
-
-* Prevents Mirth DB from growing indefinitely
-* Eliminates table bloat
-* Improves query performance
-* Reduces disk usage
-* Prevents server slowdowns or outages
-
-Ideal for production environments where message volume is high.
+The channel chooses the **oldest** pending order each poll cycle.
 
 ---
 
 ## 9. Deployment Requirements
 
-* Mirth Connect **v4.5.2**
-* PostgreSQL server running on:
-  `db1:5432` (database: `mirthdb`)
-* `VACUUM FULL` permissions for the user `mirthdb`
-* Channel must remain **Enabled** and **Started**
-* No outbound firewall requirements
-* Should be run on servers with low load during maintenance windows
+* Mirth Connect 4.5.2
+* PostgreSQL reachable at `db1:5432`
+* Directory `/opt/connect/appdata/` accessible with read/write permissions
+* Local TCP server running on **127.0.0.1:2002** (MLLP listener)
+* Linux file system permissions must allow file deletion
+
+---
+
+## 10. Logging
+
+The channel logs:
+
+* Database errors
+* File read attempts
+* TCP dispatch
+* ACK responses
+* File deletion result
+
+Log examples:
+
+```
+Sending HL7 message to rmp_order: <HL7>
+File deleted successfully: /opt/connect/appdata/12345_20250304123010.hl7
+TCP Response does not contain 'MSA|AA|'
+```
+
+---
+
+## 11. Summary
+
+This channel provides automated, scheduled dispatch of HL7 messages via MLLP based on queuing logic stored in a PostgreSQL table. It safely polls, filters, transmits, and deletes files only after successful delivery.
