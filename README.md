@@ -1,192 +1,189 @@
-# TCPSENDER – README
+# VITAL_LISTNER – README
 
 ## 1. Overview
 
-**Channel Name:** TCPSENDER  
+**Channel Name:** VITAL_LISTNER  
+**Type:** TCP Listener
+**Inbound Format:** JSON
 
-**Purpose:**  This is a simple utility channel that receives messages internally (via Channel Reader / VM Receiver) and forwards them to an external HTTP endpoint using an HTTP Sender connector.
+**Purpose:** This channel receives **JSON arrays of vital-sign messages** over TCP, splits them, and forwards each individual JSON object to another Mirth channel named **Vital_Sender**.
 
-**Typical Use Cases:**
-- Testing outbound HTTP APIs  
-- Forwarding messages from other channels  
-- Triggered programmatically using `Channel Writer` from another channel  
+It is a **router-only** channel (no database, no API calls, no transformations).
 
-**Message Flow Source → Destination**
+---
+
+## 2. High-Level Workflow
+
 ```
 
-Internal Channel Writer → TCPSENDER → HTTP Sender → http://10.254.212.219:4001
+Device / External System → TCP (port 8900, JSON array)
+↓
+TCP Listener receives JSON
+↓
+Preprocess: remove control characters
+↓
+Transformer: loop through each JSON object
+↓
+routeMessage("Vital_Sender", <JSON object>)
+↓
+Bypass destination (no-op)
 
 ````
 
 ---
 
-## 2. Workflow Summary
+## 3. Input Format
 
-1. **Source Connector:**  
-   - Channel Reader (VM Receiver)  
-   - Accepts RAW data from other channels  
+### The channel expects incoming **JSON array**, for example:
 
-2. **Destination Connector:**  
-   - HTTP Sender (POST request)  
-   - Sends message to configured server with optional query parameters  
+```json
+[
+  {
+    "patient_id": "12345",
+    "spo2": 98,
+    "hr": 77,
+    "rr": 18,
+    "timestamp": "2025-03-12T10:20:11Z"
+  },
+  {
+    "patient_id": "12345",
+    "spo2": 97,
+    "hr": 79,
+    "rr": 20,
+    "timestamp": "2025-03-12T10:20:25Z"
+  }
+]
+````
 
-3. **Response:**  
-   - No validation  
-   - No transformation  
-   - No filtering  
-   - Response returned to calling channel (if used with Channel Writer)
-
----
-
-## 3. Input / Output
-
-### 3.1 Input Format
-- **RAW message content**  
-- This channel does **not** parse HL7, JSON, XML — it sends whatever data is received.
-
-### 3.2 Output
-The outbound HTTP POST sends the **raw input content** as the HTTP body.
-
-`Content-Type: text/plain`
+Each object becomes **one routed message**.
 
 ---
 
-## 4. Source Connector Configuration
+## 4. TCP Listener Configuration
 
-**Type:** Channel Reader (VM Receiver)  
-**Inbound Datatype:** RAW  
-**Outbound Datatype:** RAW  
+| Setting              | Value                           |
+| -------------------- | ------------------------------- |
+| Host                 | `0.0.0.0`                       |
+| Port                 | **8900**                        |
+| Keep Connection Open | Yes                             |
+| Max Connections      | 10                              |
+| Start/End Bytes      | None (Basic framing)            |
+| Response             | Auto-generated after processing |
 
-**Important Properties**
-- `respondAfterProcessing = true` → calling channel waits for HTTP response  
-- No filter or transformer  
-- No batch processing  
+**Inbound Datatype:** JSON
+**Outbound Datatype:** JSON
 
-This means the channel is used like:
+---
+
+## 5. Source Transformer Logic
+
+The main processor of the channel is this script:
 
 ```javascript
-var resp = ChannelUtil.sendMessage('TCPSENDER', 'Hello world');
-````
+MessageLength = (msg.length);  
 
----
-
-## 5. Destination Connector – HTTP Sender
-
-### 5.1 Configuration
-
-| Setting               | Value                                          |
-| --------------------- | ---------------------------------------------- |
-| **Transport**         | HTTP Sender                                    |
-| **Method**            | POST                                           |
-| **URL**               | `http://10.254.212.219:4001?encounterid=72654` |
-| **Headers**           | None                                           |
-| **Parameters**        | None                                           |
-| **Content-Type**      | text/plain                                     |
-| **Charset**           | UTF-8                                          |
-| **Use Proxy**         | No                                             |
-| **Retry Count**       | 0                                              |
-| **Timeout**           | 30000 ms                                       |
-| **Process Multipart** | true                                           |
-| **Store Attachments** | false                                          |
-
-### 5.2 Payload
-
-The **entire incoming RAW message** becomes the HTTP body:
-
-```
-<incoming data>
+for (var i = 0; i < MessageLength; i++) {
+    router.routeMessage('Vital_Sender', JSON.stringify(msg[i]));
+}
 ```
 
-### 5.3 Response Handling
+### What this does:
 
-* Response is returned to the caller
-* No validation
-* Response metadata is not included
-
----
-
-## 6. Scripts
-
-All scripts are default/no-op:
-
-| Script Type     | Purpose           | Status     |
-| --------------- | ----------------- | ---------- |
-| Preprocessor    | Before source     | No changes |
-| Postprocessor   | After destination | No changes |
-| Deploy Script   | On channel deploy | Empty      |
-| Undeploy Script | On channel stop   | Empty      |
+✔ Counts number of JSON objects in the array
+✔ Loops through each one
+✔ Sends each JSON object individually to **Vital_Sender**
+✔ Ensures downstream channels receive clean, one-record-per-message data
 
 ---
 
-## 7. Code Templates / Libraries
+## 6. Preprocessing Script
 
-The channel includes references to large Mirth code template libraries (CDA, HL7 DT, custom functions), but:
+Before the transformer runs, the channel executes:
 
-**None of these templates are used by this channel.**
+```javascript
+message = message.replace(/[\u0000-\u001F]+/g, "");
+return message;
+```
 
-They only appear because the libraries are globally applied.
+Purpose:
 
----
-
-## 8. Message Storage & Metadata
-
-* **Storage Mode:** DEVELOPMENT
-* **Attachments:** stored
-* **Metadata Columns:**
-
-  * SOURCE → `mirth_source`
-  * TYPE → `mirth_type`
+* Removes hidden control/escape characters
+* Prevents JSON parse errors
 
 ---
 
-## 9. Deployment Requirements
+## 7. Destination Connector
+
+### Destination Name: `bypass`
+
+**Type:** JavaScript Writer
+**Script:**
+
+```javascript
+return 0;
+```
+
+This confirms:
+
+✔ No transformation
+✔ No external HTTP/TCP calls
+✔ No file writes
+✔ The channel acts as a pure **router**
+
+All real work is done in the source transformer.
+
+---
+
+## 8. Message Storage
+
+| Setting           | Value        |
+| ----------------- | ------------ |
+| Mode              | PRODUCTION   |
+| Store Attachments | true         |
+| Metadata Columns  | SOURCE, TYPE |
+
+---
+
+## 9. Downstream Channel Requirement
+
+This channel depends on:
+
+### **Vital_Sender**
+
+Every incoming JSON object is forwarded to this channel.
+You must ensure:
+
+* Vital_Sender is **enabled**
+* It expects **JSON input**
+* It performs the final action (DB insert, API call, etc.)
+
+---
+
+## 10. Deployment Requirements
 
 * Mirth Connect 4.5.2
-* Outbound HTTP connectivity to
-  `10.254.212.219:4001`
-* No SSL (plain HTTP)
-* No authentication required
+* Open firewall for inbound TCP **8900**
+* Device/system must send **valid JSON array**
+* Downstream channel **Vital_Sender** must exist
 
 ---
 
-## 10. Testing the Channel
+## 11. Example End-to-End Flow
 
-### 10.1 Manual Test Using Channel Writer
-
-```javascript
-var resp = ChannelUtil.sendMessage("TCPSENDER", "Test message");
-logger.info(resp);
-```
-
-### 10.2 Expected Behavior
-
-* Channel receives `"Test message"`
-* Sends POST:
+1. Device sends:
 
 ```
-POST /?encounterid=72654
-Host: 10.254.212.219:4001
-Content-Type: text/plain
-Content-Length: 12
-
-Test message
+[{"spo2":96}, {"spo2":97}]
 ```
 
-* Returns any HTTP response back to caller.
+2. VITAL_LISTNER receives it
+3. Preprocess removes invalid characters
+4. Transformer loops:
 
----
+```
+routeMessage("Vital_Sender", {"spo2":96})
+routeMessage("Vital_Sender", {"spo2":97})
+```
 
-## 11. Summary
-
-The **TCPSENDER** channel is a lightweight, utility-style channel used to forward RAW data to an HTTP API. It includes:
-
-* No filters
-* No transformers
-* No message parsing
-* Simple RAW → HTTP passthrough
-
-It is primarily designed for:
-
-* Forwarding messages via Mirth pipelines
-* Integrating with lightweight HTTP endpoints
-* Prototyping / testing outbound calls
+5. Destination bypass does nothing
+6. Vital_Sender handles actual processing
