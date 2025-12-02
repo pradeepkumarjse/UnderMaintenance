@@ -1,286 +1,192 @@
-# EpicIDSearch – README
+# TCPSENDER – README
 
 ## 1. Overview
 
-**Channel Name:** EpicIDSearch  
+**Channel Name:** TCPSENDER  
 
+**Purpose:**  This is a simple utility channel that receives messages internally (via Channel Reader / VM Receiver) and forwards them to an external HTTP endpoint using an HTTP Sender connector.
 
-**Purpose:** The EpicIDSearch channel exposes an HTTP API that accepts **query parameters** (encounterid or medical_record_number), queries a **PostgreSQL database**, and returns **patient demographic data** in JSON format.
+**Typical Use Cases:**
+- Testing outbound HTTP APIs  
+- Forwarding messages from other channels  
+- Triggered programmatically using `Channel Writer` from another channel  
 
-This channel supports:
-
-1. **Search by Encounter ID**  
-2. **Search by Medical Record Number (MRN)**  
-3. **Automatic detection** of which search parameter is provided  
-4. **JSON output** with patient details  
-5. **Age-based classification (adult / pediatric / neonate)**  
-
----
-
-## 2. Workflow
-
+**Message Flow Source → Destination**
 ```
 
-External System
-↓ HTTP GET /?encounterid=... OR /?medical_record_number=...
-HTTP Listener (Port 4000)
-↓ Parse Query Parameters
-↓ Evaluate Which Search to Perform
-↓ Search PostgreSQL (adt_messages)
-↓ Build JSON Response
-↓ Return JSON to Client
-
-```
-
----
-
-## 3. Input Request Format
-
-### Supported Query Parameters
-
-| Parameter | Required | Purpose |
-|----------|----------|---------|
-| `encounterid` | Optional | Search by encounter ID |
-| `medical_record_number` | Optional | Search by MRN (supports multiple comma-separated MRNs) |
-
-You must provide **one of the two**.
-
-### Example Requests
-
-#### Search by Encounter ID
-
-```
-
-GET http://<server>:4000/?encounterid=ENC1234
-
-```
-
-#### Search by MRN (single)
-
-```
-
-GET http://<server>:4000/?medical_record_number=MRN1001
-
-```
-
-#### Search by MRN (multiple)
-
-```
-
-GET http://<server>:4000/?medical_record_number=MRN1,MRN2,MRN3
+Internal Channel Writer → TCPSENDER → HTTP Sender → [http://10.254.212.219:4001](http://10.254.212.219:4001)
 
 ````
 
 ---
 
-## 4. Output Response Format
+## 2. Workflow Summary
 
-### 4.1 Response for Encounter ID Search
+1. **Source Connector:**  
+   - Channel Reader (VM Receiver)  
+   - Accepts RAW data from other channels  
 
-If record found:
+2. **Destination Connector:**  
+   - HTTP Sender (POST request)  
+   - Sends message to configured server with optional query parameters  
 
-```json
-{
-  "encounterid": "12345",
-  "first_name": "John",
-  "last_name": "Doe",
-  "medical_record_number": "MRN001",
-  "date_of_birth": "1990-11-02",
-  "gender": "M",
-  "patient_type": "adult",
-  "height": 175,
-  "weight": 75
-}
-````
-
-If no record found:
-
-```json
-{ "message": "No records found.." }
-```
+3. **Response:**  
+   - No validation  
+   - No transformation  
+   - No filtering  
+   - Response returned to calling channel (if used with Channel Writer)
 
 ---
 
-### 4.2 Response for MRN Search
+## 3. Input / Output
 
-If results contain **multiple patients**, an array is returned:
+### 3.1 Input Format
+- **RAW message content**  
+- This channel does **not** parse HL7, JSON, XML — it sends whatever data is received.
 
-```json
-[
-  {
-    "mrn": "MRN101",
-    "first_name": "A",
-    "last_name": "B",
-    "encounterid": "E1",
-    "date_of_birth": "1988-01-01",
-    "gender": "F"
-  },
-  {
-    "mrn": "MRN102",
-    "first_name": "C",
-    "last_name": "D",
-    "encounterid": "E2",
-    "date_of_birth": "1975-04-21",
-    "gender": "M"
-  }
-]
-```
+### 3.2 Output
+The outbound HTTP POST sends the **raw input content** as the HTTP body.
 
-If one record found, single JSON object returned.
-If none found:
-
-```json
-{ "message": "No records found.." }
-```
+`Content-Type: text/plain`
 
 ---
 
-## 5. Search Logic
+## 4. Source Connector Configuration
 
-### Parameter Extraction (Transformer JS)
+**Type:** Channel Reader (VM Receiver)  
+**Inbound Datatype:** RAW  
+**Outbound Datatype:** RAW  
 
-The channel extracts query variables from HTTP URL:
+**Important Properties**
+- `respondAfterProcessing = true` → calling channel waits for HTTP response  
+- No filter or transformer  
+- No batch processing  
 
-* Splits incoming query string
-* Decodes keys & values
-* Identifies which parameter is present
-* Sets flags:
-
-  * `Isencounterid` = 1 if encounterid is provided
-  * `Ismedical_record_number` = 1 if MRN is provided
-
----
-
-## 6. Database Queries
-
-### PostgreSQL Connection
-
-Connection used by both destination scripts:
+This means the channel is used like:
 
 ```javascript
-DatabaseConnectionFactory.createDatabaseConnection(
-  'org.postgresql.Driver',
-  'jdbc:postgresql://db1:5432/mirthdb',
-  'mirthdb',
-  'mirthdb'
-);
-```
-
-### Encounter ID Query
-
-Searches by encounterid, returns one row:
-
-```sql
-SELECT id, first_name, last_name, medical_record_number,
-       date_of_birth, gender, height, weight
-FROM adt_messages
-WHERE encounterid = ?
-ORDER BY id
-LIMIT 1;
-```
-
-### MRN Query (supports multiple MRNs)
-
-```sql
-SELECT DISTINCT first_name, last_name, encounterid,
-       date_of_birth, gender, medical_record_number
-FROM adt_messages
-WHERE medical_record_number IN (?, ?, ?, ...)
-```
+var resp = ChannelUtil.sendMessage('TCPSENDER', 'Hello world');
+````
 
 ---
 
-## 7. Business Rules
+## 5. Destination Connector – HTTP Sender
 
-### Age Classification
+### 5.1 Configuration
 
-Age in months is calculated:
+| Setting               | Value                                          |
+| --------------------- | ---------------------------------------------- |
+| **Transport**         | HTTP Sender                                    |
+| **Method**            | POST                                           |
+| **URL**               | `http://10.254.212.219:4001?encounterid=72654` |
+| **Headers**           | None                                           |
+| **Parameters**        | None                                           |
+| **Content-Type**      | text/plain                                     |
+| **Charset**           | UTF-8                                          |
+| **Use Proxy**         | No                                             |
+| **Retry Count**       | 0                                              |
+| **Timeout**           | 30000 ms                                       |
+| **Process Multipart** | true                                           |
+| **Store Attachments** | false                                          |
 
-| Age in Months | Category  |
-| ------------- | --------- |
-| ≥ 216 months  | adult     |
-| 1–215 months  | neonate   |
-| < 1 month     | pediatric |
+### 5.2 Payload
+
+The **entire incoming RAW message** becomes the HTTP body:
+
+```
+<incoming data>
+```
+
+### 5.3 Response Handling
+
+* Response is returned to the caller
+* No validation
+* Response metadata is not included
 
 ---
 
-## 8. Channel Structure (Summary)
+## 6. Scripts
 
-### **Source Connector**
+All scripts are default/no-op:
 
-* **Type:** HTTP Listener
-* **Host:** 0.0.0.0
-* **Port:** 4000
-* **Response Type:** JSON
-* **Parses query parameters** in transformer
+| Script Type     | Purpose           | Status     |
+| --------------- | ----------------- | ---------- |
+| Preprocessor    | Before source     | No changes |
+| Postprocessor   | After destination | No changes |
+| Deploy Script   | On channel deploy | Empty      |
+| Undeploy Script | On channel stop   | Empty      |
 
-### **Destination Connectors**
+---
 
-1. **Search encounterid**
+## 7. Code Templates / Libraries
 
-   * Executes encounterid DB query
-   * Outputs JSON
+The channel includes references to large Mirth code template libraries (CDA, HL7 DT, custom functions), but:
 
-2. **Search MRN**
+**None of these templates are used by this channel.**
 
-   * Supports multiple MRNs
-   * Returns single JSON or array
+They only appear because the libraries are globally applied.
 
-3. **Final Response**
+---
 
-   * Returns `response_patientData` JSON to caller
+## 8. Message Storage & Metadata
+
+* **Storage Mode:** DEVELOPMENT
+* **Attachments:** stored
+* **Metadata Columns:**
+
+  * SOURCE → `mirth_source`
+  * TYPE → `mirth_type`
 
 ---
 
 ## 9. Deployment Requirements
 
-* Windows Server with Mirth installed
-* Mirth Connect v4.5.2
-* PostgreSQL accessible at `db1:5432`
-* DB credentials:
-
-  * **User:** mirthdb
-  * **Password:** mirthdb
-* Firewall open:
-
-  * **HTTP port 4000**
+* Mirth Connect 4.5.2
+* Outbound HTTP connectivity to
+  `10.254.212.219:4001`
+* No SSL (plain HTTP)
+* No authentication required
 
 ---
 
-## 10. Example Success Response
+## 10. Testing the Channel
 
-```json
-{
-  "first_name": "John",
-  "last_name": "Doe",
-  "encounterid": "E10001",
-  "medical_record_number": "MRN2001",
-  "date_of_birth": "1985-03-22",
-  "gender": "M",
-  "patient_type": "adult",
-  "height": 180,
-  "weight": 80
-}
+### 10.1 Manual Test Using Channel Writer
+
+```javascript
+var resp = ChannelUtil.sendMessage("TCPSENDER", "Test message");
+logger.info(resp);
 ```
 
----
+### 10.2 Expected Behavior
 
-## 11. Example Error Response
+* Channel receives `"Test message"`
+* Sends POST:
 
-### Database Error Handling
-
-If DB connection fails, the logs capture the error & stack trace.
-
-Returned JSON may look like:
-
-```json
-{ "message": "No records found.." }
 ```
+POST /?encounterid=72654
+Host: 10.254.212.219:4001
+Content-Type: text/plain
+Content-Length: 12
+
+Test message
+```
+
+* Returns any HTTP response back to caller.
+
 ---
-## 12. Maintainer Notes
 
-* Query parsing logic is inside Source Transformer
-* EncounterID and MRN searches are mutually exclusive
-* Response always returned as JSON
-* Logging includes DOB, age calculation & query diagnostics
+## 11. Summary
 
+The **TCPSENDER** channel is a lightweight, utility-style channel used to forward RAW data to an HTTP API. It includes:
+
+* No filters
+* No transformers
+* No message parsing
+* Simple RAW → HTTP passthrough
+
+It is primarily designed for:
+
+* Forwarding messages via Mirth pipelines
+* Integrating with lightweight HTTP endpoints
+* Prototyping / testing outbound calls
