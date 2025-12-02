@@ -14,7 +14,7 @@
 **Message Flow Source → Destination**
 ```
 
-Internal Channel Writer → TCPSENDER → HTTP Sender → [http://10.254.212.219:4001](http://10.254.212.219:4001)
+Internal Channel Writer → TCPSENDER → HTTP Sender → http://10.254.212.219:4001
 
 ````
 
