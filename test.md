@@ -4,9 +4,8 @@
 
 **Channel Name:** FukudaAPI  
 **Protocol:** TCP Listener (HL7 over MLLP)  
-**Port:** 2003  
 
-This channel receives **HL7 ADT messages** from Epic over **MLLP**, extracts patient demographic and visit data, stores/updates the information in a PostgreSQL database, and returns a proper **HL7 ACK** message.
+**Purpose:** This channel receives **HL7 ADT messages** from Epic over **MLLP**, extracts patient demographic and visit data, stores/updates the information in a PostgreSQL database, and returns a proper **HL7 ACK** message.
 
 ---
 
