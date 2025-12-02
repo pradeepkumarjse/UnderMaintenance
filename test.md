@@ -7,8 +7,6 @@
 
 **Purpose:** This channel checks for queued RPM orders in the PostgreSQL database, identifies HL7 files scheduled to be sent, reads the HL7 message from disk, transmits it, and deletes the file upon successful ACK (MSA|AA).
 
-Source File: :contentReference[oaicite:0]{index=0}
-
 ---
 
 ## 2. High-Level Workflow
@@ -209,5 +207,4 @@ TCP Response does not contain 'MSA|AA|'
 ---
 
 ## 11. Summary
-
 This channel provides automated, scheduled dispatch of HL7 messages via MLLP based on queuing logic stored in a PostgreSQL table. It safely polls, filters, transmits, and deletes files only after successful delivery.
