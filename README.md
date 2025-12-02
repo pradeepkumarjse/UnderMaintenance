@@ -1,14 +1,26 @@
-# VITAL_LISTNER – README
+# Vital_Sender – README
 
 ## 1. Overview
 
-**Channel Name:** VITAL_LISTNER  
-**Type:** TCP Listener
-**Inbound Format:** JSON
+**Channel Name:** Vital_Sender  
 
-**Purpose:** This channel receives **JSON arrays of vital-sign messages** over TCP, splits them, and forwards each individual JSON object to another Mirth channel named **Vital_Sender**.
+**Role:** Converts incoming **JSON vital sign messages** into **HL7 ORU messages** and sends them to **EPIC** over **MLLP (port 5128)**.
 
-It is a **router-only** channel (no database, no API calls, no transformations).
+This channel is the second stage in the vitals pipeline:
+
+**Purpose:**
+
+- Receive JSON representing patient vitals  
+- Look up patient & encounter metadata from PostgreSQL  
+- Build HL7 ORU^R01 (MSH, PID, PV1, OBR, OBX segments)  
+- Convert JSON vital parameters into multiple OBX segments  
+- Send HL7 to Epic via TCP/MLLP
+
+```
+
+Device → VITAL_LISTNER → Vital_Sender → Epic (MLLP/HL7)
+
+```
 
 ---
 
@@ -16,174 +28,251 @@ It is a **router-only** channel (no database, no API calls, no transformations).
 
 ```
 
-Device / External System → TCP (port 8900, JSON array)
+SOURCE (Channel Reader, JSON)
 ↓
-TCP Listener receives JSON
-↓
-Preprocess: remove control characters
-↓
-Transformer: loop through each JSON object
-↓
-routeMessage("Vital_Sender", <JSON object>)
-↓
-Bypass destination (no-op)
+Transformer:
+
+* Validate message
+* Extract patient_id
+* Query DB (adt_messages)
+* Prepare PID, PV1 data
+* Compute timestamps (UTC → EST)
+* Create HL7 template (tmp)
+* Build OBX segments dynamically
+  ↓
+  DESTINATION (MLLP Sender → Epic)
+  ↓
+  Epic receives HL7 ORU message
 
 ````
 
 ---
 
-## 3. Input Format
+## 3. Input Format (From VITAL_LISTNER)
 
-### The channel expects incoming **JSON array**, for example:
+Vital_Sender receives **JSON array** messages, example:
 
 ```json
 [
-  {
-    "patient_id": "12345",
-    "spo2": 98,
-    "hr": 77,
-    "rr": 18,
-    "timestamp": "2025-03-12T10:20:11Z"
-  },
-  {
-    "patient_id": "12345",
-    "spo2": 97,
-    "hr": 79,
-    "rr": 20,
-    "timestamp": "2025-03-12T10:20:25Z"
-  }
+  {"tag": "Header", "patient_id": "12345", ...},
+  {"tag": "Patient ID", "patient_id": "12345"},
+  {"tag": "Name", "first_and_last_name": "JOHN DOE"},
+  {"tag": "Patient info", "sex": "M", "birthday": "19800101", "floor_number": "4"},
+  {"tag": "Data Time", "data_time": "2024-07-19T23:12:08.000Z"},
+  {"tag": "... more fields ..."}
 ]
 ````
 
-Each object becomes **one routed message**.
+Vital_Sender extracts measurements like:
+
+```
+HR_measurement_value
+SPO2_measured_value
+NBP_S_measured_value
+T1_measurement_value
+RR_measured_value
+```
 
 ---
 
-## 4. TCP Listener Configuration
+## 4. Source Connector
 
-| Setting              | Value                           |
-| -------------------- | ------------------------------- |
-| Host                 | `0.0.0.0`                       |
-| Port                 | **8900**                        |
-| Keep Connection Open | Yes                             |
-| Max Connections      | 10                              |
-| Start/End Bytes      | None (Basic framing)            |
-| Response             | Auto-generated after processing |
+| Setting                | Value                        |
+| ---------------------- | ---------------------------- |
+| Type                   | Channel Reader (VM Receiver) |
+| Inbound Datatype       | JSON                         |
+| Outbound Datatype      | JSON                         |
+| respondAfterProcessing | true                         |
 
-**Inbound Datatype:** JSON
-**Outbound Datatype:** JSON
+Vital_Sender is not externally callable — only triggered internally via `routeMessage()` by VITAL_LISTNER.
 
 ---
 
-## 5. Source Transformer Logic
+## 5. Transformer Logic (Core)
 
-The main processor of the channel is this script:
+### 5.1 Extract & Validate Patient ID
 
 ```javascript
-MessageLength = (msg.length);  
-
-for (var i = 0; i < MessageLength; i++) {
-    router.routeMessage('Vital_Sender', JSON.stringify(msg[i]));
+var raw = connectorMessage.getRawData();
+if (raw != '[]') {
+    var patient_id = msg[1]['patient_id'];
 }
 ```
 
-### What this does:
+### 5.2 DB Lookup (adt_messages)
 
-✔ Counts number of JSON objects in the array
-✔ Loops through each one
-✔ Sends each JSON object individually to **Vital_Sender**
-✔ Ensures downstream channels receive clean, one-record-per-message data
+Queries the patient encounter record:
 
----
-
-## 6. Preprocessing Script
-
-Before the transformer runs, the channel executes:
-
-```javascript
-message = message.replace(/[\u0000-\u001F]+/g, "");
-return message;
+```sql
+SELECT medical_record_number, epicencounterid, first_name, last_name, siteid
+FROM adt_messages
+WHERE encounterid = ?
+ORDER BY id LIMIT 1
 ```
 
-Purpose:
+Populates:
 
-* Removes hidden control/escape characters
-* Prevents JSON parse errors
+* **MRN**
+* **Epic Encounter ID**
+* **First/Last Name**
+* **Site ID**
 
----
+If not found → filter = 1 (skip).
 
-## 7. Destination Connector
+### 5.3 Timestamp Conversion
 
-### Destination Name: `bypass`
-
-**Type:** JavaScript Writer
-**Script:**
+Incoming timestamps are UTC → converted to EST:
 
 ```javascript
-return 0;
+var datetime = EST_time(UTC_now);
+var obr_datetime = EST_with_timezone(JSON_timestamp);
 ```
 
-This confirms:
+### 5.4 HL7 Message Build
 
-✔ No transformation
-✔ No external HTTP/TCP calls
-✔ No file writes
-✔ The channel acts as a pure **router**
+Vital_Sender fills values into the HL7 template (`tmp`):
 
-All real work is done in the source transformer.
+#### MSH
+
+```
+MSH.7  = current datetime (EST)
+MSH.10 = UUID
+```
+
+#### PID
+
+* PID-2 = patient_id
+* PID-3 = MRN
+* PID-5 = Last / First name
+* PID-7 = DOB
+* PID-8 = Sex
+
+#### PV1
+
+* PV1-3.3 = floor_number + "-" + siteid
+* PV1-19 = Epic encounter ID
+
+#### OBR
+
+* OBR.7 = Observation datetime (EST)
+* OBR.3 = datetime
 
 ---
 
-## 8. Message Storage
+## 6. OBX Segment Creation (Core Functionality)
 
-| Setting           | Value        |
-| ----------------- | ------------ |
-| Mode              | PRODUCTION   |
-| Store Attachments | true         |
-| Metadata Columns  | SOURCE, TYPE |
+Vital_Sender dynamically creates OBX segments for every measurement matching:
+
+```
+*_measurement_value
+*_measured_value
+```
+
+### 6.1 Measurement Mapping
+
+Each measurement code maps to:
+
+* MDC code (OBX.3)
+* Unit (OBX.6)
+
+Examples:
+
+| JSON Key | OBX.3 (MDC)                       | Unit                        |
+| -------- | --------------------------------- | --------------------------- |
+| HR       | `147842^MDC_ECG_HEART_RATE^MDC`   | `^MDC_DIM_BEAT_PER_MIN^MDC` |
+| SPO2     | `150456^MDC_PULS_OXIM_SAT_O2^MDC` | `^MDC_DIM_PERCENT^MDC`      |
+| RR       | `151552^MDC_RESP^MDC`             | `^MDC_DIM_RESP_PER_MIN^MDC` |
+| NBP_S    | `150020^NBP_S^MDC`                | `^MDC_DIM_MMHG^MDC`         |
+| T1       | `150344^MDC_TEMP1^MDC`            | `^MDC_DIM_DEGC^MDC`         |
+
+### 6.2 OBX creation loop
+
+For each measurement:
+
+```javascript
+tmp['OBX'][i]['OBX.1.1'] = sequenceCounter
+tmp['OBX'][i]['OBX.3.1'] = measurementMDC
+tmp['OBX'][i]['OBX.5.1'] = measurement_value
+tmp['OBX'][i]['OBX.6.1'] = unit
+tmp['OBX'][i]['OBX.14.1'] = timestamp
+```
+
+All OBX segments are numbered sequentially.
 
 ---
 
-## 9. Downstream Channel Requirement
+## 7. Destination Connector — MLLP Sender
 
-This channel depends on:
+Vital_Sender sends HL7 to Epic:
 
-### **Vital_Sender**
+| Setting          | Value                            |
+| ---------------- | -------------------------------- |
+| Type             | TCP Sender (MLLP)                |
+| Remote Host      | `epic-tst.et0948.epichosted.com` |
+| Port             | **5128**                         |
+| MLLP Start Block | `0B`                             |
+| MLLP End Block   | `1C0D`                           |
+| ACK byte         | `06`                             |
+| Timeout          | 60000 ms                         |
 
-Every incoming JSON object is forwarded to this channel.
-You must ensure:
+Payload:
 
-* Vital_Sender is **enabled**
-* It expects **JSON input**
-* It performs the final action (DB insert, API call, etc.)
+```
+${message.encodedData}
+```
+
+**Epic returns HL7 ACK/NACK**, validated by Mirth.
+
+---
+
+## 8. Filtering Logic
+
+The channel sets:
+
+```
+filter = 1 → skip sending
+```
+
+Conditions for filtering:
+
+* Missing patient_id
+* Missing MRN
+* Missing encounter record
+* Invalid raw JSON (`[]`)
+
+This prevents corrupt HL7 messages from being sent.
+
+---
+
+## 9. Database Requirements
+
+### `adt_messages` table fields used:
+
+* medical_record_number
+* epicencounterid
+* first_name
+* last_name
+* siteid
+* encounterid
 
 ---
 
 ## 10. Deployment Requirements
 
-* Mirth Connect 4.5.2
-* Open firewall for inbound TCP **8900**
-* Device/system must send **valid JSON array**
-* Downstream channel **Vital_Sender** must exist
+* Mirth 4.5.2
+* PostgreSQL (db1:5432)
+* Open outbound TCP port **5128 → EPIC**
 
 ---
 
-## 11. Example End-to-End Flow
-
-1. Device sends:
+## 11. End-to-End Flow Example
 
 ```
-[{"spo2":96}, {"spo2":97}]
+DEVICE sends JSON →
+VITAL_LISTNER splits JSON →
+routes to Vital_Sender →
+Vital_Sender builds HL7 ORU →
+Sends to Epic →
+Epic returns ACK →
+Vital_Sender logs success
 ```
-
-2. VITAL_LISTNER receives it
-3. Preprocess removes invalid characters
-4. Transformer loops:
-
-```
-routeMessage("Vital_Sender", {"spo2":96})
-routeMessage("Vital_Sender", {"spo2":97})
-```
-
-5. Destination bypass does nothing
-6. Vital_Sender handles actual processing
