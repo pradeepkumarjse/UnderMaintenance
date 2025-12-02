@@ -1,243 +1,258 @@
-# GetPatient – README
+# PDF_Listener – README
 
 ## 1. Overview
 
-**Channel Name:** GetPatient  
-**Type:** Polling JavaScript Receiver → JavaScript Destination  
+**Channel Name:** PDF_Listener  
+**Protocol:** HTTP Listener (JSON + PDF binary)  
 
-**Purpose:** This channel periodically retrieves a **Bearer token**, calls an external **Patient API**, receives a JSON array of patients, and updates a PostgreSQL table (`adt_messages`) by inserting the **patient_id** for matching MRNs.
-
-The workflow repeats automatically every **5 minutes**.
+**Purpose:** This channel receives **JSON payloads (with optional PDF content or URL)** from a remote system.  
+It extracts *patient information + order details + reviewer info*, enriches data from PostgreSQL, and sets all values into `channelMap` for downstream processing by other channels.
 
 ---
 
 ## 2. High-Level Workflow
 
 ```
-
-Scheduled Poll (every 5 minutes)
+External System → POST JSON/PDF → HTTP Listener (port 4001)
 ↓
-Step 1: GetToken (POST /api-token-auth/)
+Parse JSON payload
 ↓
-Step 2: GetPatient (GET /api/patient)
+If EMR order ID missing → lookup from rpm_orders table
 ↓
-Step 3: Parse patient list + update DB
+Lookup demographics from adt_messages table using MRN
 ↓
-End
-
-```
-
----
-
-## 3. Polling Configuration
-
-The Source Connector is a **JavaScript Reader** with these settings:
-
-| Setting | Value |
-|---------|-------|
-| Poll Type | Interval |
-| Frequency | 300000 ms (5 minutes) |
-| Poll on Start | Yes |
-| Inbound/Outbound Data Type | JSON |
-
-The source simply returns `1`, triggering the workflow during each poll.
-
----
-
-## 4. API Interactions
-
-### 4.1 Step 1 – GetToken
-
-**Method:** `POST`  
-**Endpoint:**  
-```
-
-https://telemetry-rhm.select.corp.sem/core/api-token-auth/
-
-```
-
-**Headers:**
-```
-
-Content-Type: application/json
+If message_type = "Review" → capture URL
+Else → store PDF binary
+↓
+Populate channelMap variables
+↓
+Forward processing by Destination Channel(s) (not included here)
 
 ````
+---
 
-**Payload (example):**
+## 3. Input Format
+
+### 3.1 JSON Input (example)
+
 ```json
 {
-  "username": "XXXXXXXXX",
-  "password": "XXXXXXXXX!"
+  "patient_id": "217057",
+  "message_type": "PDF",
+  "order_emr_id": 5814773,
+  "child_order_id": 5817367,
+  "rpm_order_id": 126,
+  "url": null,
+  "reviewer": null,
+  "reviewed_at": null,
+  "pdf": "<base64 PDF binary>"
 }
 ````
 
-**Response Handling:**
-
-The channel extracts:
-
-```javascript
-var token = jsonResponse.tokens.access;
-channelMap.put('token', token);
-```
-
-The token is stored and reused for the next API call.
-
-**Note:**
-The script uses a custom SSL context that **trusts all certificates**.
+The channel supports **multipart and binary payloads**, automatically parsed by Mirth.
 
 ---
 
-### 4.2 Step 2 – GetPatient
+## 4. Message Parsing Logic
 
-**Method:** `GET`
-**Endpoint:**
+### Extracted fields:
 
-```
-https://telemetry-rhm.select.corp.sem/core/api/patient
-```
+| Field            | Source                   | Required             |
+| ---------------- | ------------------------ | -------------------- |
+| `patient_id`     | JSON                     | Yes                  |
+| `message_type`   | JSON (`Review` or other) | Yes                  |
+| `order_emr_id`   | JSON or DB lookup        | Optional             |
+| `child_order_id` | JSON                     | Optional             |
+| `rpm_order_id`   | JSON                     | Yes                  |
+| `url`            | JSON                     | Only for Review      |
+| `pdf`            | JSON                     | Only for PDF uploads |
+| `reviewer`       | JSON                     | Optional             |
+| `reviewed_at`    | JSON                     | Optional             |
 
-**Headers:**
+---
 
-```
-Accept: application/json
-Authorization: Bearer <token>
-```
+## 5. EMR Order ID Auto-Lookup
 
-**Response:**
+If the incoming JSON does **not** contain `order_emr_id`, the channel will:
 
-The API returns a JSON **array** of patients:
+### Query:
 
-```json
-[
-  {
-    "id": 16,
-    "medical_record_number": "432553",
-    "date_of_birth": "1970-01-01",
-    "gender": "M",
-    "alertness_level": "ALERT",
-    "patient_type": 0
-  },
-  ...
-]
+```sql
+select order_emr_id 
+from rpm_orders 
+where medical_record_number = ?
+order by whenadded desc 
+limit 1;
 ```
 
-The full raw JSON is stored in:
+Extracted value → stored as `emr_order_id`.
 
-```javascript
-channelMap.put('patientresponse', result);
+If no record found → `child_order_id = ""`.
+
+---
+
+## 6. Reviewed_at Timestamp Reformatting
+
+Incoming format:
+
+```
+2025-03-12T05:30:22.047266+00:00
+```
+
+Converted to HL7/DB friendly format:
+
+```
+yyyyMMddHHmmss
+```
+
+Example: `20250312053022`
+
+---
+
+## 7. Patient Demographic Lookup (adt_messages)
+
+Query:
+
+```sql
+SELECT pv1,first_name,last_name,date_of_birth,gender,
+       marital_status,phone_number,address1,city,state,zip 
+FROM adt_messages 
+WHERE medical_record_number = ?
+ORDER BY id 
+LIMIT 1;
+```
+
+If found, the channel populates:
+
+* `pv1`
+* `first_name`
+* `last_name`
+* `date_of_birth` (normalized into `YYYYMMDD`)
+* `gender`
+* `marital_status`
+* `phone_number`
+* `address1`
+* `city`
+* `state`
+* `zip`
+
+If not found → `filter = 1` (used by downstream routing).
+
+---
+
+## 8. PDF & URL Handling
+
+| message_type   | Behavior                              |
+| -------------- | ------------------------------------- |
+| `"Review"`     | Uses `msg.url`, no PDF                |
+| Any other type | Extracts `msg.pdf` (base64 or binary) |
+
+Stored into:
+
+* `channelMap['url']`
+* `channelMap['PDF']`
+
+---
+
+## 9. ChannelMap Variables (Final Output)
+
+The script outputs the following variables for downstream connectors:
+
+```
+patient_id
+message_type
+emr_order_id
+child_order_id
+rpm_order_id
+reviewer
+reviewed_at
+datetime
+medical_record_number
+pv1
+last_name
+first_name
+date_of_birth
+gender
+marital_status
+phone_number
+address1
+city
+state
+zip
+url (conditional)
+PDF (conditional)
+filter (determines routing path)
 ```
 
 ---
 
-## 5. Database Update Logic
+## 10. Source Connector Configuration
 
-### Database Connection
+| Setting                | Value                                                    |
+| ---------------------- | -------------------------------------------------------- |
+| Type                   | HTTP Listener                                            |
+| Host                   | 0.0.0.0                                                  |
+| Port                   | 4001                                                     |
+| parseMultipart         | true                                                     |
+| xmlBody                | false                                                    |
+| responseContentType    | application/json                                         |
+| respondAfterProcessing | true                                                     |
+| binaryMimeTypes        | `application/* (except json, xml)` + images/videos/audio |
+| timeout                | 30000 ms                                                 |
+
+---
+
+## 11. Database Connection
+
+All DB calls use:
 
 ```javascript
 DatabaseConnectionFactory.createDatabaseConnection(
-    'org.postgresql.Driver',
-    'jdbc:postgresql://db1:5432/mirthdb',
-    'mirthdb',
-    'mirthdb'
+  'org.postgresql.Driver',
+  'jdbc:postgresql://db1:5432/mirthdb',
+  'mirthdb', 
+  'mirthdb'
 );
 ```
 
-### Logic Flow
+---
 
-For every JSON object in the patient list:
+## 12. Deployment Requirements
 
-1. Extract fields:
+* Mirth Connect v4.5.2
+* Windows/Linux server
+* PostgreSQL available at `db1:5432`
+* Inbound firewall rule:
 
-   * `jsonData.id`
-   * `jsonData.medical_record_number` (MRN)
+  * **TCP 4001** for HTTP POST
+* Table requirements:
 
-2. Check if the MRN exists in `adt_messages`:
-
-```sql
-SELECT COUNT(medical_record_number)
-FROM adt_messages
-WHERE medical_record_number = ?
-```
-
-3. If exists → update the patient_id:
-
-```sql
-UPDATE adt_messages
-SET patient_id = ?
-WHERE medical_record_number = ?
-```
-
-4. Log each update:
-
-```
-ID: <id> MRN: <mrn>
-```
-
-If database connection or query fails, errors are logged with stack trace.
+  * `rpm_orders`
+  * `adt_messages`
 
 ---
 
-## 6. Destination Connector Summary
+## 13. Example Review-Type Request
 
-Only **one destination** exists: **GetToken → GetPatient → Parse Patient** inside a single chain.
-
-| Step          | Type       | Purpose                    |
-| ------------- | ---------- | -------------------------- |
-| GetToken      | JavaScript | Obtain Bearer token        |
-| GetPatient    | JavaScript | Retrieve full patient list |
-| parse patient | JavaScript | Update DB for each MRN     |
-
-There is **no outbound response** returned to source because the channel is polling, not externally triggered.
-
----
-
-## 7. Channel Behavior Summary
-
-* Runs automatically every 5 minutes.
-* Makes HTTPS calls with SSL validation disabled.
-* Logs token, API response, and DB operations.
-* Updates existing rows only—no inserts.
-* Matches patients strictly by **medical_record_number**.
-* Stores:
-
-  * `patient_id` in `adt_messages` table.
-
----
-
-## 8. Error Handling
-
-### API Errors
-
-* Logged using:
-
-```javascript
-logger.error("Error executing POST/GET request: " + e);
+```json
+{
+  "patient_id": "217057",
+  "message_type": "Review",
+  "url": "https://example.com/review.pdf",
+  "reviewer": "Dr. Smith",
+  "reviewed_at": "2025-03-12T05:30:22.047266+00:00"
+}
 ```
 
-* Does **not** break polling; next cycle continues normally.
-
-### Database Errors
-
-* Errors logged, connection closed gracefully.
-
 ---
 
-## 9. Deployment Requirements
+## 14. Example PDF Upload Request
 
-* Mirth Connect **v4.5.2**
-* Windows Server or Linux
-* PostgreSQL server:
-
-  * Host: `db1`
-  * Port: `5432`
-  * DB: `mirthdb`
-  * User/password: `mirthdb`
-* Outbound HTTPS allowed to:
-
-  * `telemetry-rhm.select.corp.sem`
-* Firewall must allow outbound 443
-* Ensure table `adt_messages` contains:
-
-  * `medical_record_number`
-  * `patient_id`
----
+```json
+{
+  "patient_id": "217057",
+  "message_type": "PDF",
+  "pdf": "<base64_encoded_pdf_binary>",
+  "rpm_order_id": 126
+}
+```
