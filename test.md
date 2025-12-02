@@ -1,106 +1,141 @@
-# FukudaAPI – README
+# GetPatient – README
 
 ## 1. Overview
 
-**Channel Name:** FukudaAPI  
-**Protocol:** TCP Listener (HL7 over MLLP)  
+**Channel Name:** GetPatient  
+**Type:** Polling JavaScript Receiver → JavaScript Destination  
 
-**Purpose:** This channel receives **HL7 ADT messages** from Epic over **MLLP**, extracts patient demographic and visit data, stores/updates the information in a PostgreSQL database, and returns a proper **HL7 ACK** message.
+**Purpose:**  
+This channel periodically retrieves a **Bearer token**, calls an external **Patient API**, receives a JSON array of patients, and updates a PostgreSQL table (`adt_messages`) by inserting the **patient_id** for matching MRNs.
 
----
-
-## 2. Workflow
-
-```
-
-Epic System
-↓  (HL7 ADT via MLLP on port 2003)
-TCP Listener (MLLP)
-↓ Parse HL7 fields (PID, PV1, MSH, EVN)
-↓ Construct patient & encounter data
-↓ Insert or update adt_messages table
-↓ Build HL7 ACK (AA)
-↓ Return ACK to Epic
-
-```
+The workflow repeats automatically every **5 minutes**.
 
 ---
 
-## 3. Input / Output
-
-### 3.1 Input (HL7 ADT Message)
-
-The channel receives a standard HL7 ADT message such as:
+## 2. High-Level Workflow
 
 ```
 
-MSH|^~&|Epic|HOSP1|Fukuda|HOSP1|20250305114347||ADT^A01|66739|T|2.6
-EVN|A01
-PID|1||123456^^^MRN||Doe^John||19900909|M|||123 Main ST^^City||555-1234
-PV1|1|I|WARD^ROOM^BED^BLDG^HOSP1||...|...|...|...|...|123456789|...
+Scheduled Poll (every 5 minutes)
+↓
+Step 1: GetToken (POST /api-token-auth/)
+↓
+Step 2: GetPatient (GET /api/patient)
+↓
+Step 3: Parse patient list + update DB
+↓
+End
 
 ```
-
-The transformer extracts:
-
-| HL7 Field | Extracted Value |
-|----------|------------------|
-| PID.3 | MRN |
-| PV1.19 | Epic Encounter ID |
-| PV1.50 | Encounter ID (CSN) |
-| PID.5 | First/Last Name |
-| PID.7 | DOB |
-| PID.8 | Gender |
-| PV1.3 | Location string |
-| PID.13 | Phone |
-| PID.11 | Address |
-| PID.16 | Marital Status |
 
 ---
 
-### 3.2 Output (HL7 ACK Message)
+## 3. Polling Configuration
 
-The channel generates a dynamic HL7 ACK:
+The Source Connector is a **JavaScript Reader** with these settings:
+
+| Setting | Value |
+|---------|-------|
+| Poll Type | Interval |
+| Frequency | 300000 ms (5 minutes) |
+| Poll on Start | Yes |
+| Inbound/Outbound Data Type | JSON |
+
+The source simply returns `1`, triggering the workflow during each poll.
+
+---
+
+## 4. API Interactions
+
+### 4.1 Step 1 – GetToken
+
+**Method:** `POST`  
+**Endpoint:**  
+```
+
+[https://telemetry-rhm.select.corp.sem/core/api-token-auth/](https://telemetry-rhm.select.corp.sem/core/api-token-auth/)
 
 ```
 
-MSH|^~&|EpicSelect|<siteid>|Fukuda|<siteid>|<timestamp>||ACK|<msgcontrolid>|T|2.6
-MSA|AA|<msgcontrolid>
+**Headers:**
+```
+
+Content-Type: application/json
 
 ````
 
-The ACK is returned over the same MLLP connection.
-
----
-
-## 4. HL7 Field Extraction Logic
-
-The source transformer extracts and processes HL7 segments:
-
-- **MSH.4** → site ID  
-- **MSH.10** → message control ID  
-- **PV1 fields** → encounter IDs, patient location, etc.  
-- **PID fields** → MRN, name, DOB, gender, SSN, address, phone  
-- **EVN.1** → message type (A01, A03, A08, etc.)
-
-DOB is reformatted via a helper function:
-
-```javascript
-function formatDateOfBirth(rawDate) {
-    if (!rawDate || rawDate.length !== 8) return null;
-    var inputDate = new Date(Date.UTC(rawDate.substring(0,4), rawDate.substring(4,6)-1, rawDate.substring(6,8)));
-    return new java.sql.Date(inputDate.getTime());
+**Payload (example):**
+```json
+{
+  "username": "XXXXXXXXX",
+  "password": "XXXXXXXXX!"
 }
 ````
 
----
+**Response Handling:**
 
-## 5. Database Operations
-
-### 5.1 PostgreSQL Connection
+The channel extracts:
 
 ```javascript
-dbConn = DatabaseConnectionFactory.createDatabaseConnection(
+var token = jsonResponse.tokens.access;
+channelMap.put('token', token);
+```
+
+The token is stored and reused for the next API call.
+
+**Note:**
+The script uses a custom SSL context that **trusts all certificates**.
+
+---
+
+### 4.2 Step 2 – GetPatient
+
+**Method:** `GET`
+**Endpoint:**
+
+```
+https://telemetry-rhm.select.corp.sem/core/api/patient
+```
+
+**Headers:**
+
+```
+Accept: application/json
+Authorization: Bearer <token>
+```
+
+**Response:**
+
+The API returns a JSON **array** of patients:
+
+```json
+[
+  {
+    "id": 16,
+    "medical_record_number": "432553",
+    "date_of_birth": "1970-01-01",
+    "gender": "M",
+    "alertness_level": "ALERT",
+    "patient_type": 0
+  },
+  ...
+]
+```
+
+The full raw JSON is stored in:
+
+```javascript
+channelMap.put('patientresponse', result);
+```
+
+---
+
+## 5. Database Update Logic
+
+### Database Connection
+
+```javascript
+DatabaseConnectionFactory.createDatabaseConnection(
     'org.postgresql.Driver',
     'jdbc:postgresql://db1:5432/mirthdb',
     'mirthdb',
@@ -108,131 +143,103 @@ dbConn = DatabaseConnectionFactory.createDatabaseConnection(
 );
 ```
 
-### 5.2 Table Updated
+### Logic Flow
 
-**Table:** `adt_messages`
-Stores: demographic + PV1 + MSH fields.
+For every JSON object in the patient list:
 
-### 5.3 Logic
+1. Extract fields:
 
-1. Check if encounter already exists:
+   * `jsonData.id`
+   * `jsonData.medical_record_number` (MRN)
+
+2. Check if the MRN exists in `adt_messages`:
 
 ```sql
-SELECT COUNT(encounterid) FROM adt_messages WHERE encounterid = ?
+SELECT COUNT(medical_record_number)
+FROM adt_messages
+WHERE medical_record_number = ?
 ```
 
-2. If **exists → UPDATE**
+3. If exists → update the patient_id:
 
 ```sql
 UPDATE adt_messages
-SET siteid=?, pv1=?, marital_status=?, phone_number=?, address1=?, 
-    medical_record_number=?, first_name=?, last_name=?, date_of_birth=?, 
-    gender=?, height=?, weight=?, message=?, ssn=?, msgtype=?, epicencounterid=?
-WHERE encounterid = ?
+SET patient_id = ?
+WHERE medical_record_number = ?
 ```
 
-If location exists → update location:
+4. Log each update:
 
-```sql
-UPDATE adt_messages SET location=? WHERE encounterid=?
+```
+ID: <id> MRN: <mrn>
 ```
 
-3. If **not exists → INSERT**
-
-```sql
-INSERT INTO adt_messages (
-    siteid, marital_status, phone_number, address1, medical_record_number,
-    first_name, last_name, date_of_birth, gender, height, weight, message,
-    ssn, encounterid, msgtype, epicencounterid, pv1
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-```
-
-All errors are logged but not returned to Epic.
+If database connection or query fails, errors are logged with stack trace.
 
 ---
 
-## 6. ACK Message Construction
+## 6. Destination Connector Summary
 
-Example ACK:
+Only **one destination** exists: **GetToken → GetPatient → Parse Patient** inside a single chain.
 
-```
-MSH|^~\&|EpicSelect|HOSP1|Fukuda|HOSP1|20250305115000||ACK|MSG0001|T|2.6
-MSA|AA|MSG0001
-```
+| Step          | Type       | Purpose                    |
+| ------------- | ---------- | -------------------------- |
+| GetToken      | JavaScript | Obtain Bearer token        |
+| GetPatient    | JavaScript | Retrieve full patient list |
+| parse patient | JavaScript | Update DB for each MRN     |
 
-Created using:
+There is **no outbound response** returned to source because the channel is polling, not externally triggered.
+
+---
+
+## 7. Channel Behavior Summary
+
+* Runs automatically every 5 minutes.
+* Makes HTTPS calls with SSL validation disabled.
+* Logs token, API response, and DB operations.
+* Updates existing rows only—no inserts.
+* Matches patients strictly by **medical_record_number**.
+* Stores:
+
+  * `patient_id` in `adt_messages` table.
+
+---
+
+## 8. Error Handling
+
+### API Errors
+
+* Logged using:
 
 ```javascript
-channelMap.put('ACKMSG', ACKMSG);
+logger.error("Error executing POST/GET request: " + e);
 ```
 
-This ACK is the outbound data returned to Epic.
+* Does **not** break polling; next cycle continues normally.
 
----
+### Database Errors
 
-## 7. Destination Connector
-
-### Name: `dest1`
-
-### Type: JavaScript Writer
-
-### Purpose: Return **ACK** stored in:
-
-```javascript
-return $('ACKMSG');
-```
-
----
-
-## 8. Transport Details
-
-### TCP Listener Settings
-
-| Setting              | Value   |
-| -------------------- | ------- |
-| Host                 | 0.0.0.0 |
-| Port                 | 2003    |
-| MLLP Start Block     | 0B      |
-| End Block            | 1C0D    |
-| ACK                  | 06      |
-| NACK                 | 15      |
-| Keep Connection Open | true    |
-| Max Connections      | 100     |
-
-Data type: **HL7 v2.x** (ADT)
+* Errors logged, connection closed gracefully.
 
 ---
 
 ## 9. Deployment Requirements
 
-* Windows/Linux server with Mirth Connect installed
 * Mirth Connect **v4.5.2**
-* PostgreSQL reachable at `db1:5432`
-* Required firewall rule:
+* Windows Server or Linux
+* PostgreSQL server:
 
-  * **Inbound TCP 2003**
-* Ensure the `adt_messages` table exists with appropriate columns
+  * Host: `db1`
+  * Port: `5432`
+  * DB: `mirthdb`
+  * User/password: `mirthdb`
+* Outbound HTTPS allowed to:
+
+  * `telemetry-rhm.select.corp.sem`
+* Firewall must allow outbound 443
+* Ensure table `adt_messages` contains:
+
+  * `medical_record_number`
+  * `patient_id`
 
 ---
-
-## 10. Example Flow Summary
-
-1. Epic sends ADT^A01/A03/A08 message over MLLP → port 2003
-2. Channel extracts all patient + encounter fields
-3. Inserts/updates record in `adt_messages`
-4. Builds HL7 ACK
-5. Returns ACK back to Epic
-
----
-
-## 11. Notes
-* Ensure Epic uses **MLLP framing** (0x0B ... 0x1C0D)
-* Channel is already set to auto-ACK with custom ACK
-* All database errors log to Mirth but do NOT break ACK generation
-* Important fields stored:
-
-  * MRN, CSN, Epic Encounter ID
-  * Names, DOB, Gender
-  * Location (PV1.3)
-  * MSH.4 site ID
-
